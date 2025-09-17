@@ -4,11 +4,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 const NWS_API_BASE = "https://api.weather.gov";
+const OPENWEATHER_API_BASE = "https://api.openweathermap.org/data/2.5";
 const USER_AGENT = "weather-app/1.0";
+const API_KEY = process.env.OPENWEATHER_API_KEY;
 
 // Create server instance
 const server = new McpServer({
-  name: "weather",
+  name: "worldwide-weather",
   version: "1.0.0",
   capabilities: {
     resources: {},
@@ -31,6 +33,23 @@ async function makeNWSRequest<T>(url: string): Promise<T | null> {
     return (await response.json()) as T;
   } catch (error) {
     console.error("Error making NWS request:", error);
+    return null;
+  }
+}
+
+// Helper function for making OpenWeatherMap API requests
+async function makeOpenWeatherRequest<T>(endpoint: string, params: Record<string, string>): Promise<T | null> {
+  const queryParams = new URLSearchParams(params);
+  const url = `${OPENWEATHER_API_BASE}/${endpoint}?${queryParams}`;
+
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    return (await response.json()) as T;
+  } catch (error) {
+    console.error("Error making OpenWeatherMap request:", error);
     return null;
   }
 }
@@ -81,6 +100,52 @@ interface ForecastResponse {
   properties: {
     periods: ForecastPeriod[];
   };
+}
+
+interface OpenWeatherCurrentResponse {
+  name: string;
+  sys: {
+    country: string;
+  };
+  main: {
+    temp: number;
+    feels_like: number;
+    humidity: number;
+    pressure: number;
+  };
+  weather: Array<{
+    main: string;
+    description: string;
+  }>;
+  wind: {
+    speed: number;
+    deg?: number;
+  };
+  visibility?: number;
+}
+
+interface OpenWeatherForecastResponse {
+  city: {
+    name: string;
+    country: string;
+  };
+  list: Array<{
+    dt: number;
+    main: {
+      temp: number;
+      feels_like: number;
+      humidity: number;
+    };
+    weather: Array<{
+      main: string;
+      description: string;
+    }>;
+    wind: {
+      speed: number;
+      deg?: number;
+    };
+    dt_txt: string;
+  }>;
 }
 
 // Register weather tools
@@ -220,10 +285,147 @@ server.tool(
   },
 );
 
+// Add worldwide weather tools
+server.tool(
+  "get_current_weather",
+  "Get current weather for any city worldwide",
+  {
+    city: z.string().describe("City name (e.g., Tokyo, London, New York)"),
+    country: z.string().optional().describe("Country code (optional, e.g., JP, GB, US)"),
+  },
+  async ({ city, country }) => {
+    if (!API_KEY) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "OpenWeatherMap API key not found. Please set OPENWEATHER_API_KEY environment variable.",
+          },
+        ],
+      };
+    }
+
+    const params: Record<string, string> = {
+      q: country ? `${city},${country}` : city,
+      appid: API_KEY,
+      units: "metric",
+    };
+
+    const weatherData = await makeOpenWeatherRequest<OpenWeatherCurrentResponse>("weather", params);
+
+    if (!weatherData) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to retrieve weather data for ${city}${country ? `, ${country}` : ""}. Please check the city name.`,
+          },
+        ],
+      };
+    }
+
+    const windDirection = weatherData.wind.deg
+      ? `${weatherData.wind.deg}°`
+      : "Unknown";
+
+    const weatherText = [
+      `Current weather for ${weatherData.name}, ${weatherData.sys.country}:`,
+      `Temperature: ${weatherData.main.temp}°C (feels like ${weatherData.main.feels_like}°C)`,
+      `Weather: ${weatherData.weather[0]?.description || "Unknown"}`,
+      `Humidity: ${weatherData.main.humidity}%`,
+      `Pressure: ${weatherData.main.pressure} hPa`,
+      `Wind: ${weatherData.wind.speed} m/s ${windDirection}`,
+      weatherData.visibility ? `Visibility: ${(weatherData.visibility / 1000).toFixed(1)} km` : "",
+    ].filter(Boolean).join("\n");
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: weatherText,
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  "get_weather_forecast",
+  "Get 5-day weather forecast for any city worldwide",
+  {
+    city: z.string().describe("City name (e.g., Tokyo, London, New York)"),
+    country: z.string().optional().describe("Country code (optional, e.g., JP, GB, US)"),
+    days: z.number().min(1).max(5).default(3).describe("Number of days to forecast (1-5, default: 3)"),
+  },
+  async ({ city, country, days }) => {
+    if (!API_KEY) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "OpenWeatherMap API key not found. Please set OPENWEATHER_API_KEY environment variable.",
+          },
+        ],
+      };
+    }
+
+    const params: Record<string, string> = {
+      q: country ? `${city},${country}` : city,
+      appid: API_KEY,
+      units: "metric",
+    };
+
+    const forecastData = await makeOpenWeatherRequest<OpenWeatherForecastResponse>("forecast", params);
+
+    if (!forecastData) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to retrieve forecast data for ${city}${country ? `, ${country}` : ""}. Please check the city name.`,
+          },
+        ],
+      };
+    }
+
+    // Group forecast by day and take the first forecast for each day
+    const dailyForecasts = forecastData.list
+      .filter((_, index) => index % 8 === 0) // Take every 8th item (24 hours / 3 hour intervals)
+      .slice(0, days);
+
+    const formattedForecast = dailyForecasts.map((forecast) => {
+      const date = new Date(forecast.dt * 1000).toLocaleDateString();
+      const windDirection = forecast.wind.deg
+        ? `${forecast.wind.deg}°`
+        : "Unknown";
+
+      return [
+        `${date}:`,
+        `Temperature: ${forecast.main.temp}°C (feels like ${forecast.main.feels_like}°C)`,
+        `Weather: ${forecast.weather[0]?.description || "Unknown"}`,
+        `Humidity: ${forecast.main.humidity}%`,
+        `Wind: ${forecast.wind.speed} m/s ${windDirection}`,
+        "---",
+      ].join("\n");
+    });
+
+    const forecastText = `${days}-day forecast for ${forecastData.city.name}, ${forecastData.city.country}:\n\n${formattedForecast.join("\n")}`;
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: forecastText,
+        },
+      ],
+    };
+  },
+);
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Weather MCP Server running on stdio");
+  console.error("Worldwide Weather MCP Server running on stdio");
 }
 
 main().catch((error) => {
